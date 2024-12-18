@@ -1,12 +1,11 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+import shutil
 import os
 import numpy as np
 from PIL import Image
-from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
-import tensorflow as tf
+import tflite_runtime.interpreter as tflite  # Usar tflite-runtime para cargar el modelo
 
-# Inicializar la aplicación FastAPI
 app = FastAPI()
 
 # Configurar CORS para permitir solicitudes desde cualquier origen.
@@ -18,50 +17,58 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Definir la ruta del modelo
-BASE_DIR = os.path.dirname(__file__)
-MODEL_PATH = os.path.join(BASE_DIR, 'TallerPerritos.keras')
+# Definir la ruta al modelo TFLite
+MODEL_PATH = "TallerPerritos.tflite"
 
-# Cargar el modelo al iniciar la aplicación
+# Cargar el modelo TFLite
 try:
-    model = tf.keras.models.load_model(MODEL_PATH)
-    print("Modelo cargado exitosamente.")
-except Exception as e:
-    print(f"Error al cargar el modelo: {e}")
-    model = None
+    interpreter = tflite.Interpreter(model_path=MODEL_PATH)
+    interpreter.allocate_tensors()
 
-# Función para cargar y preprocesar la imagen
+    # Obtener detalles de entrada y salida del modelo
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+    print("Modelo TFLite cargado exitosamente.")
+except Exception as e:
+    print(f"Error al cargar el modelo TFLite: {e}")
+    interpreter = None
+
+
 def load_and_preprocess_image(image_path):
     """
-    Carga y preprocesa la imagen para que sea compatible con el modelo TensorFlow.
+    Carga y preprocesa la imagen para que sea compatible con TensorFlow Lite.
     """
     img = Image.open(image_path).convert('RGB')  # Convertir a RGB
     img = img.resize((224, 224))  # Redimensionar a 224x224
-    img_array = np.array(img)  # Convertir a un arreglo numpy
-    img_array = preprocess_input(img_array)  # Preprocesar la imagen
-    return np.expand_dims(img_array, axis=0)  # Agregar una dimensión adicional para lotes
+    img_array = np.array(img, dtype=np.float32)  # Convertir a arreglo de tipo float32
+    img_array = img_array / 127.5 - 1.0  # Escalar píxeles al rango [-1, 1]
+    return np.expand_dims(img_array, axis=0)  # Agregar una dimensión para lotes
+
 
 @app.post("/classify_pet")
 async def classify_pet(file: UploadFile = File(...)):
-    """
-    Endpoint para clasificar si la imagen subida es de un perro o no.
-    """
     try:
-        # Verificar si el modelo está cargado
-        if model is None:
-            return {"error": "El modelo no se cargó correctamente."}
+        # Verificar si el intérprete TFLite está cargado
+        if interpreter is None:
+            return {"error": "El modelo TFLite no se cargó correctamente."}
 
         # Guardar la imagen temporalmente
         temp_image_path = "temp_image.jpg"
         with open(temp_image_path, "wb") as buffer:
-            buffer.write(await file.read())
+            shutil.copyfileobj(file.file, buffer)
 
         # Preprocesar la imagen
         processed_image = load_and_preprocess_image(temp_image_path)
 
-        # Realizar la predicción
-        prediction = model.predict(processed_image)
-        confidence = prediction[0][0]
+        # Establecer la entrada del modelo
+        interpreter.set_tensor(input_details[0]['index'], processed_image)
+
+        # Ejecutar la inferencia
+        interpreter.invoke()
+
+        # Obtener el resultado de salida
+        output_data = interpreter.get_tensor(output_details[0]['index'])
+        confidence = output_data[0][0]
 
         # Eliminar la imagen temporal
         os.remove(temp_image_path)
@@ -76,7 +83,7 @@ async def classify_pet(file: UploadFile = File(...)):
     except Exception as e:
         return {"error": str(e)}
 
-# Mensaje de inicio
+
 @app.get("/")
 def read_root():
-    return {"mensaje": "API de clasificación de mascotas activa."}
+    return {"mensaje": "API de clasificación de mascotas con TFLite activa."}
